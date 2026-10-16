@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: escala-louvor-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: escala
+      POSTGRES_PASSWORD: escala
+      POSTGRES_DB: escala
+    ports:
+      - "5433:5432"
+    volumes:
+      - escala_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U escala -d escala"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  escala_pgdata:

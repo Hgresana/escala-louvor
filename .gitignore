@@ -27,11 +27,11 @@
 # debug
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files: nunca versionar segredos, mas o modelo (.env.example) vai para o Git
 .env*
+!.env.example
 
 # vercel
 .vercel

@@ -1,0 +1,413 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ═══════════════════════ ENUMS ═══════════════════════
+enum TeamRole {
+  LEADER
+  MEMBER
+}
+
+enum ProfileKind {
+  STANDARD   // perfil próprio de quem tem login
+  DEPENDENT  // filho/dependente, controlado por um titular
+  OFFLINE    // membro sem celular, gerenciado pelos líderes
+}
+
+enum SlotRequirement {
+  REQUIRED
+  OPTIONAL
+}
+
+enum PollStatus {
+  DRAFT
+  OPEN
+  CLOSED
+}
+
+enum ScheduleStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum Availability {
+  AVAILABLE
+  UNAVAILABLE
+}
+
+enum AssignmentSource {
+  AUTO
+  MANUAL   // travada: o auto-preenchimento nunca sobrescreve
+}
+
+enum AssignmentFlag {
+  CONSECUTIVE    // escalado em dia seguido / turno seguido
+  NOT_AVAILABLE  // líder escalou quem não marcou disponível
+  NOT_QUALIFIED  // líder escalou quem não tem essa função no perfil
+  DOUBLE_BOOKED  // mesma pessoa em 2+ vagas no mesmo culto
+}
+
+enum NotificationType {
+  POLL_OPENED
+  SCHEDULE_PUBLISHED
+  SCHEDULE_CHANGED
+  REMINDER
+}
+
+// ═══════════════════════ AUTH (Better Auth) ═══════════════════════
+// Os nomes e tipos dos campos de User/Session/Account/Verification seguem o
+// schema esperado pelo Better Auth (adapter Prisma). Não renomeie esses campos.
+model User {
+  id            String   @id
+  name          String
+  email         String   @unique
+  emailVerified Boolean  @default(false)
+  image         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  sessions          Session[]
+  accounts          Account[]
+  memberships       TeamMembership[]
+  profiles          MemberProfile[]    // perfil próprio + dependentes que esta conta controla
+  pushSubscriptions PushSubscription[]
+  notificationLogs  NotificationLog[]
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}
+
+// ═══════════════════════ EQUIPE ═══════════════════════
+model Team {
+  id                String    @id @default(cuid())
+  name              String
+  slug              String    @unique
+  timezone          String    @default("America/Sao_Paulo")
+  reminderLeadHours Int       @default(24)   // lembrete X horas antes do culto
+  createdAt         DateTime  @default(now())
+  archivedAt        DateTime?
+
+  // ── Regras do auto-preenchimento (o líder pode alterar a qualquer momento) ──
+  /// true  → penaliza escalar a mesma pessoa em dias/turnos seguidos (W_CONSECUTIVE alto)
+  /// false → sem penalidade (W_CONSECUTIVE = 0)
+  avoidConsecutiveDays      Boolean @default(true)
+  /// false → vaga OPCIONAL fica vazia em vez de quebrar a regra de dias seguidos
+  optionalAllowsConsecutive Boolean @default(false)
+  /// false → 1 pessoa = 1 vaga por culto · true → permite acumular (flag DOUBLE_BOOKED)
+  allowDoubleBooking        Boolean @default(false)
+
+  memberships TeamMembership[]
+  invites     TeamInvite[]
+  profiles    MemberProfile[]
+  roles       Role[]
+  templates   ServiceTemplate[]
+  polls       Poll[]
+  eventSlots  PollEventSlot[]
+}
+
+/// Vínculo conta ↔ equipe (só quem tem login). Dependentes e offline NÃO têm membership.
+model TeamMembership {
+  id               String    @id @default(cuid())
+  teamId           String
+  userId           String
+  role             TeamRole  @default(MEMBER)
+  notifyPollOpened Boolean   @default(true)
+  notifySchedule   Boolean   @default(true)
+  notifyReminders  Boolean   @default(true)
+  onboardedAt      DateTime?
+  joinedAt         DateTime  @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([userId])
+}
+
+model TeamInvite {
+  id             String    @id @default(cuid())
+  teamId         String
+  token          String    @unique            // aleatório, 32 bytes, url-safe
+  createdById    String                       // auditoria (sem FK)
+  claimProfileId String?                      // se preenchido: ao aceitar, a conta assume um perfil OFFLINE existente (mantém o histórico)
+  expiresAt      DateTime?
+  maxUses        Int?
+  useCount       Int       @default(0)
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([teamId])
+}
+
+// ═══════════════════════ PERFIS (quem entra na escala) ═══════════════════════
+model MemberProfile {
+  id              String      @id @default(cuid())
+  teamId          String
+  kind            ProfileKind
+  /// Conta que CONTROLA o perfil (vota, recebe push).
+  /// STANDARD → o próprio usuário · DEPENDENT → o titular · OFFLINE → null
+  userId          String?
+  displayName     String
+  avatarUrl       String?
+  alwaysAvailable Boolean     @default(false) // só OFFLINE; vale quando não há voto explícito
+  archivedAt      DateTime?                   // nunca deletar: preserva histórico de escalas
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  team        Team                 @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user        User?                @relation(fields: [userId], references: [id], onDelete: Restrict)
+  roles       MemberRole[]
+  votes       AvailabilityVote[]
+  assignments ScheduleAssignment[]
+
+  @@index([teamId, kind])
+  @@index([userId])
+}
+
+// ═══════════════════════ FUNÇÕES DINÂMICAS ═══════════════════════
+model Role {
+  id         String    @id @default(cuid())
+  teamId     String
+  name       String                // "Vocal 1 (Violão/Condução)", "Sonoplasta"...
+  color      String?
+  icon       String?               // nome de ícone lucide
+  sortOrder  Int       @default(0)
+  archivedAt DateTime?             // arquivar em vez de apagar
+
+  team          Team                  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  memberRoles   MemberRole[]
+  templateSlots ServiceTemplateSlot[]
+  positions     EventPosition[]
+
+  @@unique([teamId, name])
+}
+
+/// Aptidões do perfil. Um perfil pode ter várias funções.
+model MemberRole {
+  profileId String
+  roleId    String
+  isPrimary Boolean @default(false)
+
+  profile MemberProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  role    Role          @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([profileId, roleId])
+  @@index([roleId])
+}
+
+// ═══════════════════════ TEMPLATES / PRESETS DE CULTO ═══════════════════════
+/// Vários por equipe ("Banda Completa", "Banda Reduzida"...). Exatamente um é o padrão
+/// (índice parcial no SQL customizado). Os botões "Tudo Obrigatório" / "Tudo Opcional"
+/// da interface apenas alteram `requirement` em lote nos slots (não são tabelas).
+model ServiceTemplate {
+  id        String   @id @default(cuid())
+  teamId    String
+  name      String
+  isDefault Boolean  @default(false)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  team       Team                  @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  slots      ServiceTemplateSlot[]
+  eventSlots PollEventSlot[]
+
+  @@unique([teamId, name])
+}
+
+model ServiceTemplateSlot {
+  id          String          @id @default(cuid())
+  templateId  String
+  roleId      String
+  requirement SlotRequirement @default(REQUIRED)
+  sortOrder   Int             @default(0)
+
+  template ServiceTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  role     Role            @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  @@index([templateId])
+}
+
+// ═══════════════════════ ENQUETE + CULTOS ═══════════════════════
+/// Ciclo mensal de planejamento: a enquete e a escala daquele mês vivem no mesmo registro.
+/// Escala manual "do zero" = Poll com votação pulada (status CLOSED, openedAt null).
+model Poll {
+  id                  String         @id @default(cuid())
+  teamId              String
+  title               String         // "Escalas de Novembro/2026"
+  month               DateTime       @db.Date  // 1º dia do mês de referência
+  status              PollStatus     @default(DRAFT)
+  openedAt            DateTime?
+  closesAt            DateTime?      // prazo para votar
+  closedAt            DateTime?
+  scheduleStatus      ScheduleStatus @default(DRAFT)
+  schedulePublishedAt DateTime?
+  createdById         String         // auditoria (sem FK)
+  createdAt           DateTime       @default(now())
+
+  team       Team            @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  eventSlots PollEventSlot[]
+
+  @@index([teamId, month])
+}
+
+/// Um culto/turno. Vários por dia são permitidos (Domingo Manhã e Domingo Noite).
+model PollEventSlot {
+  id          String    @id @default(cuid())
+  pollId      String
+  teamId      String    // denormalizado para consultas "próximos cultos" e isolamento por tenant
+  date        DateTime  @db.Date   // data local (agrupar, calcular dias seguidos)
+  startsAt    DateTime             // instante absoluto (ordenação e lembretes)
+  label       String               // "Domingo Manhã"
+  templateId  String?              // de qual template as vagas foram copiadas
+  notes       String?
+  cancelledAt DateTime?
+
+  poll        Poll                 @relation(fields: [pollId], references: [id], onDelete: Cascade)
+  team        Team                 @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  template    ServiceTemplate?     @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  positions   EventPosition[]
+  votes       AvailabilityVote[]
+  assignments ScheduleAssignment[]
+
+  @@index([teamId, date])
+  @@index([pollId, startsAt])
+}
+
+/// Vaga concreta de um culto. É COPIADA do template na criação do culto,
+/// então editar o template depois não reescreve cultos antigos.
+model EventPosition {
+  id          String          @id @default(cuid())
+  eventSlotId String
+  roleId      String
+  requirement SlotRequirement @default(REQUIRED)
+  sortOrder   Int             @default(0)
+
+  eventSlot  PollEventSlot       @relation(fields: [eventSlotId], references: [id], onDelete: Cascade)
+  role       Role                @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  assignment ScheduleAssignment? // 0 ou 1 pessoa por vaga
+
+  @@index([eventSlotId])
+}
+
+// ═══════════════════════ DISPONIBILIDADE ═══════════════════════
+/// Ausência de linha = "não respondeu".
+/// Perfil OFFLINE com alwaysAvailable e sem linha = disponível (ver algoritmo).
+model AvailabilityVote {
+  id           String       @id @default(cuid())
+  eventSlotId  String
+  profileId    String
+  availability Availability
+  castByUserId String       // quem votou (titular, ou líder por membro offline)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  eventSlot PollEventSlot @relation(fields: [eventSlotId], references: [id], onDelete: Cascade)
+  profile   MemberProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([eventSlotId, profileId])
+  @@index([profileId])
+}
+
+// ═══════════════════════ ESCALA ═══════════════════════
+/// ATENÇÃO: NÃO existe unique (eventSlotId, profileId). A regra "1 pessoa = 1 vaga por culto"
+/// é aplicada pela aplicação conforme Team.allowDoubleBooking; quando alguém acumula vagas,
+/// a flag DOUBLE_BOOKED é gravada. O banco só garante "1 pessoa por vaga" (positionId único).
+model ScheduleAssignment {
+  id           String           @id @default(cuid())
+  eventSlotId  String           // denormalizado para consultas por culto
+  positionId   String           @unique   // 1 pessoa por vaga
+  profileId    String
+  source       AssignmentSource
+  flags        AssignmentFlag[]
+  note         String?
+  assignedById String?          // auditoria (sem FK)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  eventSlot PollEventSlot @relation(fields: [eventSlotId], references: [id], onDelete: Cascade)
+  position  EventPosition @relation(fields: [positionId], references: [id], onDelete: Cascade)
+  profile   MemberProfile @relation(fields: [profileId], references: [id], onDelete: Restrict)
+
+  @@index([eventSlotId, profileId])
+  @@index([profileId])
+}
+
+// ═══════════════════════ PUSH ═══════════════════════
+/// Assinatura por APARELHO da conta. Push de dependente vai para o titular.
+model PushSubscription {
+  id            String    @id @default(cuid())
+  userId        String
+  endpoint      String    @unique
+  p256dh        String
+  auth          String
+  userAgent     String?
+  failureCount  Int       @default(0)   // remover após falhas 404/410 repetidas
+  lastSuccessAt DateTime?
+  createdAt     DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Idempotência: o job de lembretes roda de tempos em tempos e não pode enviar duas vezes.
+model NotificationLog {
+  id        String           @id @default(cuid())
+  userId    String
+  type      NotificationType
+  dedupeKey String           @unique   // ex: "REMINDER:{eventSlotId}:{profileId}"
+  sentAt    DateTime         @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
